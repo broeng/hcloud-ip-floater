@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/hetznercloud/hcloud-go/hcloud"
 	"github.com/sirupsen/logrus"
@@ -45,6 +48,9 @@ func main() {
 
 	logger.WithFields(logrus.Fields{"version": version}).Info("starting hcloud IP floater")
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	var k8sCfg *rest.Config
 	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
 		cfg, err := rest.InClusterConfig()
@@ -74,6 +80,7 @@ func main() {
 	fipc := fipcontroller.New(logger, hcc)
 
 	sc := servicecontroller.Controller{
+		Context: ctx,
 		Logger: logger,
 		K8S:    k8s,
 		FIPc:   fipc,

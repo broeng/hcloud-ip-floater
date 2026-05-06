@@ -2,7 +2,9 @@ package servicecontroller
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
@@ -12,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -27,6 +30,7 @@ type podInformerType struct {
 }
 
 type Controller struct {
+	Context context.Context
 	Logger logrus.FieldLogger
 	K8S    *kubernetes.Clientset
 	FIPc   *fipcontroller.Controller
@@ -37,6 +41,12 @@ type Controller struct {
 	svcInformerFactory informers.SharedInformerFactory
 	podInformers       map[string]podInformerType
 	podInformersMu     sync.RWMutex
+}
+
+type PatchPath struct {
+	Op    string      `json:"op"`
+	Path  string      `json:"path"`
+	Value interface{} `json:"value,omitempty"`
 }
 
 func (sc *Controller) Run() {
@@ -372,6 +382,96 @@ func (sc *Controller) handleServiceIPs(svc *corev1.Service, svcIPs stringset.Str
 	electedNode := nodes[0]
 
 	sc.FIPc.AttachToNode(svcIPs, electedNode)
+
+	errr := sc.syncNodeLabels(svcIPs, electedNode)
+	if errr != nil {
+		return errr
+	}
+
+	return nil
+}
+
+func (sc *Controller) syncNodeLabels(svcIPs stringset.StringSet, targetNode string) error {
+	logger := sc.Logger.WithFields(logrus.Fields{
+		"component": "sync-node-labels",
+		"targetNode": targetNode,
+	})
+	logger.Info("syncing floating IP node labels")
+
+	timeoutCtx, cancel := context.WithTimeout(sc.Context, 120*time.Second)
+	defer cancel()
+
+	targetLabels := make(stringset.StringSet)
+	for ip := range svcIPs {
+		targetLabels.Add("floating-ip-" + ip)
+	}
+
+	nodes, err := sc.K8S.CoreV1().Nodes().List(timeoutCtx, metav1.ListOptions{})
+	if err != nil {
+		logger.WithError(err).Error("failed to list nodes")
+		return err
+	}
+
+	for _, node := range nodes.Items {
+		for targetLabel := range targetLabels {
+			_, hasLabel := node.Labels[targetLabel]
+			if hasLabel && node.Name != targetNode {
+				logger.Info("removing label " + targetLabel + " from node " + node.Name)
+				// Remove label from node
+				payloadBytes, err := json.Marshal([]PatchPath{
+					{
+						Op: "remove",
+						Path: "/metadata/labels/" + targetLabel,
+					},
+				})
+				if err == nil {
+					_, err = sc.K8S.CoreV1().Nodes().Patch(
+						timeoutCtx,
+						node.Name,
+						types.JSONPatchType,
+						payloadBytes,
+						metav1.PatchOptions{},
+					)
+					if err != nil {
+						logger.WithError(err).Error("failed to remove label " + targetLabel)
+						return err
+					}
+				} else {
+					logger.WithError(err).Error("failed to marshal patch for label removal")
+					return err
+				}
+			} else if hasLabel == false && node.Name == targetNode {
+				// Add label
+				logger.Info("adding label " + targetLabel)
+				// Add label to node
+				payloadBytes, err := json.Marshal([]PatchPath{
+					{
+						Op: "add",
+						Path: "/metadata/labels/" + targetLabel,
+						Value: "assigned",
+					},
+				})
+				if err == nil {
+					_, err = sc.K8S.CoreV1().Nodes().Patch(
+						timeoutCtx,
+						node.Name,
+						types.JSONPatchType,
+						payloadBytes,
+						metav1.PatchOptions{},
+					)
+					if err != nil {
+						logger.WithError(err).Error("failed to assign label " + targetLabel)
+						return err
+					}
+				} else {
+					logger.WithError(err).Error("failed to marshal patch for label assignment")
+					return err
+				}
+			}
+		}
+	}
+
+
 	return nil
 }
 
